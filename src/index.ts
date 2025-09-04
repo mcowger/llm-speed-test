@@ -21,16 +21,11 @@ interface Config {
   effort: 'minimal' | 'low' | 'medium' | 'high' | undefined;
 }
 
-interface Metrics {
-  timeToFirstTokenMs: number;
-  totalWallClockTimeMs: number;
-  outputRateTpsFromFirstToken: number;
-  outputRateTpsFromRequestStart: number;
-}
-
 interface TokenCounts {
   promptTokens: number;
-  outputTokens: number;
+  completionTokens: number;
+  reasoningTokens: number;
+  totalOutputTokens: number;
 }
 
 interface LatencyStats {
@@ -54,7 +49,25 @@ interface BenchmarkResults {
   };
   metrics: Metrics;
   tokenCounts: TokenCounts;
+}
+
+interface ViewpointMetrics {
+  outputTokens: number;
+  timeToFirstTokenMs: number;
+  timeToSecondTokenMs: number;
+  outputRateTpsFromSecondToken: number;
+  outputRateTpsFromRequestStart: number;
   interTokenLatencyMs: InterTokenLatency;
+}
+
+interface Metrics {
+  totalWallClockTimeMs: number;
+  timeToSecondTokenMs: number;
+  views: {
+    reasoningInclusive: ViewpointMetrics;
+    reasoningOnly: ViewpointMetrics;
+    completionOnly: ViewpointMetrics;
+  };
 }
 
 // --- Utility Functions ---
@@ -238,11 +251,17 @@ async function runBenchmark(config: Config): Promise<void> {
 
   progress.start('Connecting...');
   const T_start = performance.now();
-  let T_first_token: number | null = null;
+  let T_second_token: number | null = null;
 
-  const interTokenLatencies: number[] = [];
-  let outputTokens = 0;
-  let lastTokenChunkTime: number | null = null;
+  const tokenTimestamps = {
+    all: [] as number[],
+    completion: [] as number[],
+    reasoning: [] as number[],
+  };
+
+  let totalOutputTokens = 0;
+  let completionTokens = 0;
+  let reasoningTokens = 0;
 
   try {
     const url = new URL(apiBaseUrl);
@@ -302,7 +321,9 @@ async function runBenchmark(config: Config): Promise<void> {
       const chunk = decoder.decode(value, { stream: true });
       const lines = chunk.split('\n').filter((line) => line.trim().startsWith('data:'));
 
-      let chunkContainsToken = false;
+      let chunkProducedTokens = false;
+      let chunkProducedCompletionTokens = 0;
+      let chunkProducedReasoningTokens = 0;
       for (const line of lines) {
         const data = line.substring(5).trim();
         if (data === '[DONE]') {
@@ -310,50 +331,103 @@ async function runBenchmark(config: Config): Promise<void> {
         }
         try {
           const parsed = JSON.parse(data);
-          if (parsed.choices[0]?.delta?.content) {
-            chunkContainsToken = true;
-            outputTokens++;
+          const delta = parsed.choices?.[0]?.delta;
+          if (!delta) {
+            continue;
+          }
+          const completionCount = countTokenLikeEntries(delta.content);
+          const reasoningCount = countTokenLikeEntries(delta.reasoning);
+          const reasoningContentCount = countTokenLikeEntries((delta as Record<string, unknown>).reasoning_content);
+          const totalReasoning = reasoningCount + reasoningContentCount;
+          if (completionCount > 0 || totalReasoning > 0) {
+            chunkProducedTokens = true;
+            chunkProducedCompletionTokens += completionCount;
+            chunkProducedReasoningTokens += totalReasoning;
           }
         } catch (e) {
           // Ignore parsing errors for non-JSON lines
         }
       }
 
-      if (chunkContainsToken) {
+      if (chunkProducedTokens) {
         const chunkTime = performance.now();
 
-        if (T_first_token === null) {
-          T_first_token = chunkTime;
+        const producedTokens = chunkProducedCompletionTokens + chunkProducedReasoningTokens;
+        totalOutputTokens += producedTokens;
+        completionTokens += chunkProducedCompletionTokens;
+        reasoningTokens += chunkProducedReasoningTokens;
+
+        const registerTimestamp = (container: number[], count: number) => {
+          for (let i = 0; i < count; i++) {
+            container.push(chunkTime);
+          }
+        };
+
+        if (chunkProducedCompletionTokens > 0) {
+          registerTimestamp(tokenTimestamps.completion, chunkProducedCompletionTokens);
+          registerTimestamp(tokenTimestamps.all, chunkProducedCompletionTokens);
         }
 
-        if (lastTokenChunkTime !== null) {
-          interTokenLatencies.push(chunkTime - lastTokenChunkTime);
+        if (chunkProducedReasoningTokens > 0) {
+          registerTimestamp(tokenTimestamps.reasoning, chunkProducedReasoningTokens);
+          registerTimestamp(tokenTimestamps.all, chunkProducedReasoningTokens);
         }
-        lastTokenChunkTime = chunkTime;
 
-        if (T_first_token) {
-            const elapsedS = (performance.now() - T_first_token) / 1000;
-            const tokensPerSecond = elapsedS > 0 ? outputTokens / elapsedS : 0;
-            progress.update(`Receiving Tokens... (${outputTokens} tokens received @ ${tokensPerSecond.toFixed(2)} tokens/s)`);
+        if (tokenTimestamps.all.length >= 2 && T_second_token === null) {
+          T_second_token = tokenTimestamps.all[1]!;
         }
+
+        const totalTokensLabel = totalOutputTokens === 1 ? 'token' : 'tokens';
+        const completionLabel = completionTokens === 1 ? 'token' : 'tokens';
+        const reasoningLabel = reasoningTokens === 1 ? 'token' : 'tokens';
+
+        let message = `Receiving Tokens... (total: ${totalOutputTokens} ${totalTokensLabel}`;
+        message += ` | completion: ${completionTokens} ${completionLabel}`;
+        message += ` | reasoning: ${reasoningTokens} ${reasoningLabel}`;
+
+        if (T_second_token && totalOutputTokens > 1) {
+          const elapsedS = (chunkTime - T_second_token) / 1000;
+          const tokensSinceSecond = totalOutputTokens - 1;
+          const tokensPerSecond = elapsedS > 0 ? tokensSinceSecond / elapsedS : 0;
+          message += ` @ ${tokensPerSecond.toFixed(2)} tokens/s`;
+        }
+        message += ')';
+        progress.update(message);
       }
     }
 
     const T_end = performance.now();
     progress.stop('Finished receiving tokens.');
     const totalWallClockTimeMs = T_end - T_start;
-    const timeToFirstTokenMs = T_first_token ? T_first_token - T_start : 0;
 
     // Estimate prompt tokens using tiktoken
     const encoding = get_encoding('cl100k_base');
     const promptTokens = encoding.encode(prompt).length;
     encoding.free();
 
-    const outputDurationMs = totalWallClockTimeMs - timeToFirstTokenMs;
-    const outputRateTpsFromFirstToken = outputDurationMs > 0 ? (outputTokens / outputDurationMs) * 1000 : 0;
-    const outputRateTpsFromRequestStart = totalWallClockTimeMs > 0 ? (outputTokens / totalWallClockTimeMs) * 1000 : 0;
+    const inclusiveMetrics = computeViewpointMetrics(
+      tokenTimestamps.all,
+      totalOutputTokens,
+      totalWallClockTimeMs,
+      T_start,
+      T_end,
+    );
 
-    const latencyStats = calculateLatencyStats(interTokenLatencies);
+    const reasoningOnlyMetrics = computeViewpointMetrics(
+      tokenTimestamps.reasoning,
+      reasoningTokens,
+      totalWallClockTimeMs,
+      T_start,
+      T_end,
+    );
+
+    const completionOnlyMetrics = computeViewpointMetrics(
+      tokenTimestamps.completion,
+      completionTokens,
+      totalWallClockTimeMs,
+      T_start,
+      T_end,
+    );
 
     const results: BenchmarkResults = {
       configuration: {
@@ -361,18 +435,19 @@ async function runBenchmark(config: Config): Promise<void> {
         model,
       },
       metrics: {
-        timeToFirstTokenMs: parseFloat(timeToFirstTokenMs.toFixed(2)),
         totalWallClockTimeMs: parseFloat(totalWallClockTimeMs.toFixed(2)),
-        outputRateTpsFromFirstToken: parseFloat(outputRateTpsFromFirstToken.toFixed(2)),
-        outputRateTpsFromRequestStart: parseFloat(outputRateTpsFromRequestStart.toFixed(2)),
+        timeToSecondTokenMs: parseFloat((T_second_token ? T_second_token - T_start : 0).toFixed(2)),
+        views: {
+          reasoningInclusive: inclusiveMetrics,
+          reasoningOnly: reasoningOnlyMetrics,
+          completionOnly: completionOnlyMetrics,
+        },
       },
       tokenCounts: {
         promptTokens,
-        outputTokens,
-      },
-      interTokenLatencyMs: {
-        ...latencyStats,
-        latencies: interTokenLatencies,
+        completionTokens,
+        reasoningTokens,
+        totalOutputTokens,
       },
     };
 
@@ -395,9 +470,31 @@ function printResults(results: BenchmarkResults, asJson: boolean): void {
     // Create a new object for JSON output that doesn't include the full latencies array
     const jsonOutput = {
       ...results,
-      interTokenLatencyMs: {
-        ...results.interTokenLatencyMs,
-        latencies: undefined, // Remove the detailed list for the final JSON output
+      metrics: {
+        ...results.metrics,
+        views: {
+          reasoningInclusive: {
+            ...results.metrics.views.reasoningInclusive,
+            interTokenLatencyMs: {
+              ...results.metrics.views.reasoningInclusive.interTokenLatencyMs,
+              latencies: undefined,
+            },
+          },
+          reasoningOnly: {
+            ...results.metrics.views.reasoningOnly,
+            interTokenLatencyMs: {
+              ...results.metrics.views.reasoningOnly.interTokenLatencyMs,
+              latencies: undefined,
+            },
+          },
+          completionOnly: {
+            ...results.metrics.views.completionOnly,
+            interTokenLatencyMs: {
+              ...results.metrics.views.completionOnly.interTokenLatencyMs,
+              latencies: undefined,
+            },
+          },
+        },
       },
     };
     // delete jsonOutput.interTokenLatencyMs.latencies;
@@ -417,27 +514,39 @@ function printResults(results: BenchmarkResults, asJson: boolean): void {
 
   console.log('Metrics');
   console.log('-----------------------');
-  console.log(`Time to First Token:   ${results.metrics.timeToFirstTokenMs} ms (${ms(results.metrics.timeToFirstTokenMs)})`);
   console.log(`Total Wall Clock Time: ${results.metrics.totalWallClockTimeMs} ms (${ms(results.metrics.totalWallClockTimeMs)})`);
-  console.log(`Output Rate (since 1st token): ${results.metrics.outputRateTpsFromFirstToken} tokens/sec`);
-  console.log(`Output Rate (wall clock):      ${results.metrics.outputRateTpsFromRequestStart} tokens/sec`);
+  console.log(`Time to Second Token (all tokens): ${results.metrics.timeToSecondTokenMs} ms (${ms(results.metrics.timeToSecondTokenMs)})`);
   console.log();
 
   console.log('Token Counts');
   console.log('-----------------------');
   console.log(`Prompt Tokens:         ${results.tokenCounts.promptTokens} (estimated)`);
-  console.log(`Output Tokens:         ${results.tokenCounts.outputTokens}`);
+  console.log(`Reasoning Tokens:      ${results.tokenCounts.reasoningTokens}`);
+  console.log(`Completion Tokens:     ${results.tokenCounts.completionTokens}`);
+  console.log(`Total Output Tokens:   ${results.tokenCounts.totalOutputTokens}`);
+  console.log();
+
+  const { reasoningInclusive, reasoningOnly, completionOnly } = results.metrics.views;
+
+  console.log('Reasoning + Completion View');
+  console.log('-----------------------');
+  console.log(`Time to Second Token:             ${reasoningInclusive.timeToSecondTokenMs} ms (${ms(reasoningInclusive.timeToSecondTokenMs)})`);
+  console.log(`Time to Second Reasoning Token:   ${reasoningOnly.timeToSecondTokenMs} ms (${ms(reasoningOnly.timeToSecondTokenMs)})`);
+  console.log(`Time to Second Completion Token:  ${completionOnly.timeToSecondTokenMs} ms (${ms(completionOnly.timeToSecondTokenMs)})`);
+  console.log(`Output Rate (since 2nd reasoning token): ${reasoningOnly.outputRateTpsFromSecondToken} tokens/sec`);
+  console.log(`Output Rate (since 2nd completion token): ${completionOnly.outputRateTpsFromSecondToken} tokens/sec`);
+  console.log(`Output Rate (wall clock):              ${reasoningInclusive.outputRateTpsFromRequestStart} tokens/sec`);
   console.log();
 
   console.log('Inter-Token Latency (ms)');
   console.log('-----------------------');
-  console.log(`Min:                 ${results.interTokenLatencyMs.min} ms`);
-  console.log(`Mean:                ${results.interTokenLatencyMs.mean} ms`);
-  console.log(`Median:              ${results.interTokenLatencyMs.median} ms`);
-  console.log(`Max:                 ${results.interTokenLatencyMs.max} ms`);
-  console.log(`p90:                 ${results.interTokenLatencyMs.p90} ms`);
-  console.log(`p95:                 ${results.interTokenLatencyMs.p95} ms`);
-  console.log(`p99:                 ${results.interTokenLatencyMs.p99} ms`);
+  console.log(`Min:                 ${reasoningInclusive.interTokenLatencyMs.min} ms`);
+  console.log(`Mean:                ${reasoningInclusive.interTokenLatencyMs.mean} ms`);
+  console.log(`Median:              ${reasoningInclusive.interTokenLatencyMs.median} ms`);
+  console.log(`Max:                 ${reasoningInclusive.interTokenLatencyMs.max} ms`);
+  console.log(`p90:                 ${reasoningInclusive.interTokenLatencyMs.p90} ms`);
+  console.log(`p95:                 ${reasoningInclusive.interTokenLatencyMs.p95} ms`);
+  console.log(`p99:                 ${reasoningInclusive.interTokenLatencyMs.p99} ms`);
 }
 
 // --- Entry Point ---
@@ -452,3 +561,89 @@ function printResults(results: BenchmarkResults, asJson: boolean): void {
     process.exit(1);
   }
 })();
+
+/**
+ * Counts token-like entries within a streamed delta field.
+ * @param value - The value to examine for token content.
+ * @returns The number of token-like entries discovered.
+ */
+function countTokenLikeEntries(value: unknown): number {
+  if (value === null || value === undefined) {
+    return 0;
+  }
+
+  if (typeof value === 'string') {
+    return value.trim() ? 1 : 0;
+  }
+
+  if (Array.isArray(value)) {
+    return value.reduce((total, item) => total + countTokenLikeEntries(item), 0);
+  }
+
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    if (obj.tokens !== undefined) {
+      return countTokenLikeEntries(obj.tokens);
+    }
+    if (obj.content !== undefined) {
+      return countTokenLikeEntries(obj.content);
+    }
+    if (typeof obj.text === 'string') {
+      return obj.text.trim() ? 1 : 0;
+    }
+    return 0;
+  }
+
+  return 0;
+}
+
+/**
+ * Computes throughput and latency statistics for a given set of token timestamps.
+ * @param timestamps - The timestamps for each token in the view.
+ * @param tokenCount - The total number of tokens in the view.
+ * @param totalWallClockTimeMs - The total wall clock time of the run.
+ * @param start - The benchmark start time.
+ * @param end - The benchmark end time.
+ * @returns Metrics describing the selected viewpoint.
+ */
+function computeViewpointMetrics(
+  timestamps: number[],
+  tokenCount: number,
+  totalWallClockTimeMs: number,
+  start: number,
+  end: number,
+): ViewpointMetrics {
+  const timeToFirstTokenMs = timestamps[0] !== undefined ? timestamps[0] - start : 0;
+  const timeToSecondTokenMs = timestamps[1] !== undefined ? timestamps[1] - start : 0;
+
+  const tokensExcludingFirst = Math.max(tokenCount - 1, 0);
+  const outputDurationMsFromSecondToken = timestamps[1] !== undefined ? end - timestamps[1]! : 0;
+  const outputRateTpsFromSecondToken = outputDurationMsFromSecondToken > 0
+    ? (tokensExcludingFirst / outputDurationMsFromSecondToken) * 1000
+    : 0;
+  const outputRateTpsFromRequestStart = totalWallClockTimeMs > 0
+    ? (tokensExcludingFirst / totalWallClockTimeMs) * 1000
+    : 0;
+
+  const latencies: number[] = [];
+  for (let i = 1; i < timestamps.length; i++) {
+    const previous = timestamps[i - 1];
+    const current = timestamps[i];
+    if (previous !== undefined && current !== undefined) {
+      latencies.push(current - previous);
+    }
+  }
+  const latencyStats = calculateLatencyStats(latencies);
+
+  return {
+    outputTokens: tokenCount,
+    timeToFirstTokenMs: parseFloat(timeToFirstTokenMs.toFixed(2)),
+    timeToSecondTokenMs: parseFloat(timeToSecondTokenMs.toFixed(2)),
+    outputRateTpsFromSecondToken: parseFloat(outputRateTpsFromSecondToken.toFixed(2)),
+    outputRateTpsFromRequestStart: parseFloat(outputRateTpsFromRequestStart.toFixed(2)),
+    interTokenLatencyMs: {
+      ...latencyStats,
+      latencies,
+    },
+  };
+}

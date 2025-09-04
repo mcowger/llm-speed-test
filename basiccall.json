@@ -1,0 +1,8 @@
+{ "model": "hf:zai-org/GLM-4.5", 
+  "stream": true, 
+  "messages": 
+    [
+          { "role": "system", "content": "You are a helpful assistant." },
+          { "role": "user", "content": "Hello! How are you?" }
+    ]
+}
