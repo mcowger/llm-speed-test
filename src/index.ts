@@ -5,6 +5,7 @@ import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import dotenv from 'dotenv';
 import { get_encoding } from 'tiktoken';
+import ms from 'ms';
 
 // Load environment variables from .env file
 dotenv.config({ quiet: true });
@@ -17,12 +18,14 @@ interface Config {
   model: string;
   prompt: string;
   json: boolean;
+  effort: 'minimal' | 'low' | 'medium' | 'high' | undefined;
 }
 
 interface Metrics {
   timeToFirstTokenMs: number;
   totalWallClockTimeMs: number;
-  overallOutputRateTps: number;
+  outputRateTpsFromFirstToken: number;
+  outputRateTpsFromRequestStart: number;
 }
 
 interface TokenCounts {
@@ -197,6 +200,12 @@ async function getConfig(): Promise<Config> {
       description: 'Output the results in JSON format.',
       default: false,
     })
+    .option('effort', {
+      alias: 'e',
+      type: 'string',
+      description: 'Reasoning effort level.',
+      choices: ['minimal', 'low', 'medium', 'high'] as const,
+    })
     .help()
     .alias('help', 'h')
     .parse();
@@ -214,6 +223,7 @@ async function getConfig(): Promise<Config> {
     model: argv.model as string,
     prompt: argv.prompt as string,
     json: argv.json ?? false,
+    effort: argv.effort,
   };
   return config;
 }
@@ -223,7 +233,7 @@ async function getConfig(): Promise<Config> {
  * @param config - The configuration object.
  */
 async function runBenchmark(config: Config): Promise<void> {
-  const { apiBaseUrl, apiKey, model, prompt, json } = config;
+  const { apiBaseUrl, apiKey, model, prompt, json, effort } = config;
   const progress = new ProgressIndicator(json);
 
   progress.start('Connecting...');
@@ -231,8 +241,8 @@ async function runBenchmark(config: Config): Promise<void> {
   let T_first_token: number | null = null;
 
   const interTokenLatencies: number[] = [];
-  let lastChunkTime = 0;
   let outputTokens = 0;
+  let lastTokenChunkTime: number | null = null;
 
   try {
     const url = new URL(apiBaseUrl);
@@ -247,6 +257,23 @@ async function runBenchmark(config: Config): Promise<void> {
         finalUrl = new URL('v1/chat/completions', url);
     }
 
+    const body: {
+      model: string;
+      messages: { role: string; content: string }[];
+      stream: boolean;
+      reasoning?: {
+        effort: 'minimal' | 'low' | 'medium' | 'high';
+      };
+    } = {
+      model,
+      messages: [{ role: 'user', content: prompt }],
+      stream: true,
+    };
+
+    if (effort) {
+      body.reasoning = { effort };
+    }
+
     progress.update('Sending Request...');
     const response = await fetch(finalUrl, {
       method: 'POST',
@@ -254,11 +281,7 @@ async function runBenchmark(config: Config): Promise<void> {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: prompt }],
-        stream: true,
-      }),
+      body: JSON.stringify(body),
     });
 
     if (!response.ok || !response.body) {
@@ -276,19 +299,10 @@ async function runBenchmark(config: Config): Promise<void> {
         break;
       }
 
-      const chunkTime = performance.now();
-      if (T_first_token === null) {
-        T_first_token = chunkTime;
-      }
-
-      if (lastChunkTime > 0) {
-        interTokenLatencies.push(chunkTime - lastChunkTime);
-      }
-      lastChunkTime = chunkTime;
-
       const chunk = decoder.decode(value, { stream: true });
       const lines = chunk.split('\n').filter((line) => line.trim().startsWith('data:'));
 
+      let chunkContainsToken = false;
       for (const line of lines) {
         const data = line.substring(5).trim();
         if (data === '[DONE]') {
@@ -296,15 +310,31 @@ async function runBenchmark(config: Config): Promise<void> {
         }
         try {
           const parsed = JSON.parse(data);
-          const content = parsed.choices[0]?.delta?.content;
-          if (content) {
+          if (parsed.choices[0]?.delta?.content) {
+            chunkContainsToken = true;
             outputTokens++;
-            const elapsedS = (performance.now() - T_first_token) / 1000;
-            const tokensPerSecond = elapsedS > 0 ? outputTokens / elapsedS : 0;
-            progress.update(`Receiving Tokens... (${outputTokens} tokens received @ ${tokensPerSecond.toFixed(2)} tokens/s)`);
           }
         } catch (e) {
           // Ignore parsing errors for non-JSON lines
+        }
+      }
+
+      if (chunkContainsToken) {
+        const chunkTime = performance.now();
+
+        if (T_first_token === null) {
+          T_first_token = chunkTime;
+        }
+
+        if (lastTokenChunkTime !== null) {
+          interTokenLatencies.push(chunkTime - lastTokenChunkTime);
+        }
+        lastTokenChunkTime = chunkTime;
+
+        if (T_first_token) {
+            const elapsedS = (performance.now() - T_first_token) / 1000;
+            const tokensPerSecond = elapsedS > 0 ? outputTokens / elapsedS : 0;
+            progress.update(`Receiving Tokens... (${outputTokens} tokens received @ ${tokensPerSecond.toFixed(2)} tokens/s)`);
         }
       }
     }
@@ -319,8 +349,9 @@ async function runBenchmark(config: Config): Promise<void> {
     const promptTokens = encoding.encode(prompt).length;
     encoding.free();
 
-    const outputDurationS = (totalWallClockTimeMs - timeToFirstTokenMs) / 1000;
-    const overallOutputRateTps = outputDurationS > 0 ? outputTokens / outputDurationS : 0;
+    const outputDurationMs = totalWallClockTimeMs - timeToFirstTokenMs;
+    const outputRateTpsFromFirstToken = outputDurationMs > 0 ? (outputTokens / outputDurationMs) * 1000 : 0;
+    const outputRateTpsFromRequestStart = totalWallClockTimeMs > 0 ? (outputTokens / totalWallClockTimeMs) * 1000 : 0;
 
     const latencyStats = calculateLatencyStats(interTokenLatencies);
 
@@ -332,7 +363,8 @@ async function runBenchmark(config: Config): Promise<void> {
       metrics: {
         timeToFirstTokenMs: parseFloat(timeToFirstTokenMs.toFixed(2)),
         totalWallClockTimeMs: parseFloat(totalWallClockTimeMs.toFixed(2)),
-        overallOutputRateTps: parseFloat(overallOutputRateTps.toFixed(2)),
+        outputRateTpsFromFirstToken: parseFloat(outputRateTpsFromFirstToken.toFixed(2)),
+        outputRateTpsFromRequestStart: parseFloat(outputRateTpsFromRequestStart.toFixed(2)),
       },
       tokenCounts: {
         promptTokens,
@@ -385,9 +417,10 @@ function printResults(results: BenchmarkResults, asJson: boolean): void {
 
   console.log('Metrics');
   console.log('-----------------------');
-  console.log(`Time to First Token:   ${results.metrics.timeToFirstTokenMs} ms`);
-  console.log(`Total Wall Clock Time: ${results.metrics.totalWallClockTimeMs} ms`);
-  console.log(`Overall Output Rate:   ${results.metrics.overallOutputRateTps} tokens/sec`);
+  console.log(`Time to First Token:   ${results.metrics.timeToFirstTokenMs} ms (${ms(results.metrics.timeToFirstTokenMs)})`);
+  console.log(`Total Wall Clock Time: ${results.metrics.totalWallClockTimeMs} ms (${ms(results.metrics.totalWallClockTimeMs)})`);
+  console.log(`Output Rate (since 1st token): ${results.metrics.outputRateTpsFromFirstToken} tokens/sec`);
+  console.log(`Output Rate (wall clock):      ${results.metrics.outputRateTpsFromRequestStart} tokens/sec`);
   console.log();
 
   console.log('Token Counts');

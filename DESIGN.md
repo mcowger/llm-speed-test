@@ -1,0 +1,169 @@
+Of course. Here is a detailed specification for the LLM benchmarking tool.
+
+***
+
+## Project Specification: LLM Provider Performance Benchmarking Tool
+
+### 1. Project Overview
+
+This document outlines the specification for a command-line interface (CLI) tool named "LLM Speed Bench". The tool will be written in TypeScript and will benchmark the performance of Large Language Model (LLM) providers that offer an OpenAI-compatible API.
+
+The primary purpose of this tool is to provide detailed, actionable data on the output speed and latency characteristics of different models and providers. It will measure key performance indicators from the moment a request is sent until the final token of the response is received.
+
+### 2. Core Features
+
+*   **OpenAI-Compatible:** The tool must be compatible with any API that adheres to the OpenAI API specification for chat completions, specifically for streaming responses.
+*   **Streaming First:** The entire benchmarking process is predicated on using the provider's streaming API to get detailed timing data.
+*   **Detailed Performance Metrics:** The tool will collect and calculate a comprehensive set of metrics, including token counts, time to first token, inter-token latency, and overall throughput.
+*   **Flexible Input:** Configuration will be manageable via both command-line arguments and environment variables for easy integration into different workflows.
+*   **Clear Output:** Results will be presented in a clean, human-readable format, with an option for machine-readable JSON output.
+
+### 3. Technical Requirements
+
+*   **Language:** TypeScript
+*   **Runtime:** Node.js (latest LTS version)
+*   **HTTP Client:** A robust HTTP client capable of handling streaming responses (e.g., `axios` or the built-in `fetch` in Node.js 18+).
+*   **Argument Parsing:** A library to handle CLI arguments (e.g., `yargs` or `commander`).
+*   **Environment Variable Handling:** A library to manage environment variables (e.g., `dotenv`).
+
+### 4. Input Handling
+
+The tool must accept the following four inputs. The order of precedence should be CLI arguments first, then environment variables.
+
+| Parameter | CLI Argument | Environment Variable | Type | Required | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| API Base URL | `--api-base-url <url>` | `LLM_API_BASE_URL` | string | Yes | The base URL for the OpenAI-compatible API endpoint. |
+| API Key | `--api-key <key>` | `LLM_API_KEY` | string | Yes | The authentication key for the API. |
+| Model Name | `--model <name>` | `LLM_MODEL_NAME` | string | Yes | The specific model to be benchmarked (e.g., `gpt-4o`). |
+| Prompt | `--prompt <text>` | `LLM_PROMPT` | string | Yes | The input text to send to the model. |
+
+### 5. Benchmarking Process
+
+The tool should execute the following steps in sequence:
+
+1.  **Configuration Loading:** Load the four required inputs from CLI arguments or environment variables. If any are missing, exit with a helpful error message.
+2.  **Start Wall Clock Timer:** Record a high-precision timestamp (`T_start`) right before making the API request.
+3.  **API Request:** Send a POST request to the specified API base URL (typically to a `/v1/chat/completions` endpoint). The request body must be a JSON object with `model`, `messages` (containing the user prompt), and `stream: true`.
+4.  **Measure Time to First Token:**
+    *   Record a high-precision timestamp (`T_first_token`) immediately upon receiving the first byte of the response body.
+    *   The **Time to First Token (TTFT)** is calculated as `T_first_token - T_start`.
+5.  **Process Stream:**
+    *   As data chunks (Server-Sent Events) arrive, record a high-precision timestamp for each chunk.
+    *   Parse each chunk to extract the content (the output token or tokens).
+    *   Maintain a count of the tokens received in each chunk.
+    *   Store the time difference between the arrival of consecutive chunks. This list of time differences will form the basis of the inter-token latency distribution.
+6.  **Stop Wall Clock Timer:** Once the stream is closed (indicated by the `[DONE]` message in the SSE stream), record a final high-precision timestamp (`T_end`).
+7.  **Data Calculation:** Perform the final calculations for all the metrics outlined in the next section.
+8.  **Output Results:** Display the benchmark results to the console in the specified format.
+
+### 6. Data Collection & Metrics
+
+The following metrics must be calculated and displayed. All time-based measurements should be in milliseconds (ms).
+
+| Metric | Unit | Description | Calculation Method |
+| :--- | :--- | :--- | :--- |
+| **Prompt Token Count** | tokens | The number of tokens in the user-provided prompt. | This should be requested from the API if available in the final response object. If not, it should be estimated using a local tokenizer (e.g., `tiktoken`) and clearly marked as an estimate. |
+| **Output Token Count** | tokens | The total number of tokens generated by the model in the response. | Sum the number of tokens generated in each chunk of the streamed response. |
+| **Total Wall Clock Time** | ms | The total real-world time taken for the entire operation. | `T_end - T_start` |
+| **Time to First Token (TTFT)** | ms | The latency between sending the request and receiving the beginning of a response. | `T_first_token - T_start` |
+| **Overall Output Rate** | tokens/sec | The average number of tokens generated by the model per second. | `(Output Token Count) / (Total Wall Clock Time - TTFT) * 1000` |
+| **Inter-Token Latency** | ms | The distribution of time delays between consecutive response chunks. | This is not a single value but a distribution. The tool should calculate and display the following statistics from the collection of inter-chunk timings: **min, max, mean, median, p90, p95, p99**. |
+
+### 7. Output Format
+
+The default output should be a human-readable summary printed to the console. An optional `--json` flag should be available to output the raw data and calculated metrics as a single JSON object.
+
+#### Standard Output Example:
+
+```
+LLM Benchmark Results
+=======================
+
+Configuration
+-----------------------
+Provider API Base:   https://api.groq.com/openai
+Model:               llama3-70b-8192
+
+Metrics
+-----------------------
+Time to First Token:   152 ms
+Total Wall Clock Time: 2,130 ms
+Overall Output Rate:   234.7 tokens/sec
+
+Token Counts
+-----------------------
+Prompt Tokens:         35
+Output Tokens:         450
+
+Inter-Token Latency (ms)
+-----------------------
+Min:                 2 ms
+Mean:                4.1 ms
+Median:              4 ms
+Max:                 15 ms
+p90:                 6 ms
+p95:                 8 ms
+p99:                 12 ms
+```
+
+#### JSON Output Example (`--json`):
+
+```json
+{
+  "configuration": {
+    "apiBaseUrl": "https://api.groq.com/openai",
+    "model": "llama3-70b-8192"
+  },
+  "metrics": {
+    "timeToFirstTokenMs": 152,
+    "totalWallClockTimeMs": 2130,
+    "overallOutputRateTps": 234.7
+  },
+  "tokenCounts": {
+    "promptTokens": 35,
+    "outputTokens": 450
+  },
+  "interTokenLatencyMs": {
+    "min": 2,
+    "mean": 4.1,
+    "median": 4,
+    "max": 15,
+    "p90": 6,
+    "p95": 8,
+    "p99": 12,
+    "latencies": [4, 5, 3, 4, 4, 6, 8, 2, 5, ... ]
+  }
+}
+```
+
+### 8. Error Handling
+
+The tool must gracefully handle potential errors, including:
+
+*   **Invalid Input:** Missing or malformed arguments/environment variables.
+*   **API Errors:** Invalid API key, model not found, rate limiting, server errors (HTTP status codes 4xx, 5xx).
+*   **Network Errors:** Connection timeouts, DNS issues.
+
+Error messages should be descriptive and printed to `stderr`. The application should exit with a non-zero status code upon error.
+
+### 9. Example Usage
+
+```bash
+# Using CLI arguments
+./llm-speed-bench \
+  --api-base-url "https://api.openai.com/v1" \
+  --api-key "sk-..." \
+  --model "gpt-4o" \
+  --prompt "Tell me a short story about a robot who discovers music."
+
+# Using environment variables
+export LLM_API_BASE_URL="https://api.openai.com/v1"
+export LLM_API_KEY="sk-..."
+export LLM_MODEL_NAME="gpt-4o"
+export LLM_PROMPT="Tell me a short story about a robot who discovers music."
+./llm-speed-bench
+
+# Getting JSON output
+./llm-speed-bench --json > results.json
+```
+
