@@ -442,11 +442,12 @@ async function runBenchmark(config: Config): Promise<void> {
       }
     }
 
-    const totalWallClockTimeMs = T_end - T_start;
+
 
     // Estimate prompt tokens using tiktoken
     const promptTokens = encoding.encode(prompt).length;
     encoding.free();
+    const totalWallClockTimeMs = T_end - T_start;
 
     const inclusiveMetrics = computeViewpointMetrics(
       tokenTimestamps.all,
