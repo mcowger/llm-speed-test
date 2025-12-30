@@ -246,31 +246,34 @@ async function getConfig(): Promise<Config> {
  * @param config - The configuration object.
  */
 async function runBenchmark(config: Config): Promise<void> {
-  const { apiBaseUrl, apiKey, model, prompt, json, effort } = config;
-  const progress = new ProgressIndicator(json);
+   const { apiBaseUrl, apiKey, model, prompt, json, effort } = config;
+   const progress = new ProgressIndicator(json);
 
-  progress.start('Connecting...');
-  const T_start = performance.now();
-  let T_second_token: number | null = null;
+   progress.start('Connecting...');
+   const T_start = performance.now();
+   let T_second_token: number | null = null;
 
-  const tokenTimestamps = {
-    all: [] as number[],
-    completion: [] as number[],
-    reasoning: [] as number[],
-  };
+   const tokenTimestamps = {
+     all: [] as number[],
+     completion: [] as number[],
+     reasoning: [] as number[],
+   };
 
-  let totalOutputTokens = 0;
-  let completionTokens = 0;
-  let reasoningTokens = 0;
+   let totalOutputTokens = 0;
+   let completionTokens = 0;
+   let reasoningTokens = 0;
 
-  try {
+   // Initialize encoding for token counting
+   const encoding = get_encoding('cl100k_base');
+
+   try {
     const url = new URL(apiBaseUrl);
-    if (!url.pathname.endsWith('/')) {
+    if (!url.pathname.endsWith('/')) {  
       url.pathname += '/';
     }
 
     let finalUrl;
-    if (url.pathname.endsWith('/v1/')) {
+    if (url.pathname.endsWith('/v1/') || url.pathname.endsWith('/v4/')) {
         finalUrl = new URL('chat/completions', url);
     } else {
         finalUrl = new URL('v1/chat/completions', url);
@@ -335,9 +338,9 @@ async function runBenchmark(config: Config): Promise<void> {
           if (!delta) {
             continue;
           }
-          const completionCount = countTokenLikeEntries(delta.content);
-          const reasoningCount = countTokenLikeEntries(delta.reasoning);
-          const reasoningContentCount = countTokenLikeEntries((delta as Record<string, unknown>).reasoning_content);
+          const completionCount = countTokensInContent(delta.content, encoding);
+          const reasoningCount = countTokensInContent(delta.reasoning, encoding);
+          const reasoningContentCount = countTokensInContent((delta as Record<string, unknown>).reasoning_content, encoding);
           const totalReasoning = reasoningCount + reasoningContentCount;
           if (completionCount > 0 || totalReasoning > 0) {
             chunkProducedTokens = true;
@@ -401,7 +404,6 @@ async function runBenchmark(config: Config): Promise<void> {
     const totalWallClockTimeMs = T_end - T_start;
 
     // Estimate prompt tokens using tiktoken
-    const encoding = get_encoding('cl100k_base');
     const promptTokens = encoding.encode(prompt).length;
     encoding.free();
 
@@ -563,38 +565,45 @@ function printResults(results: BenchmarkResults, asJson: boolean): void {
 })();
 
 /**
- * Counts token-like entries within a streamed delta field.
+ * Counts actual tokens in content using tiktoken encoding.
  * @param value - The value to examine for token content.
- * @returns The number of token-like entries discovered.
+ * @param encoding - The tiktoken encoding instance.
+ * @returns The number of tokens in the content.
  */
-function countTokenLikeEntries(value: unknown): number {
-  if (value === null || value === undefined) {
-    return 0;
-  }
+function countTokensInContent(value: unknown, encoding: any): number {
+   if (value === null || value === undefined) {
+     return 0;
+   }
 
-  if (typeof value === 'string') {
-    return value.trim() ? 1 : 0;
-  }
+   if (typeof value === 'string') {
+     if (!value.trim()) {
+       return 0;
+     }
+     return encoding.encode(value).length;
+   }
 
-  if (Array.isArray(value)) {
-    return value.reduce((total, item) => total + countTokenLikeEntries(item), 0);
-  }
+   if (Array.isArray(value)) {
+     return value.reduce((total, item) => total + countTokensInContent(item, encoding), 0);
+   }
 
-  if (typeof value === 'object') {
-    const obj = value as Record<string, unknown>;
-    if (obj.tokens !== undefined) {
-      return countTokenLikeEntries(obj.tokens);
-    }
-    if (obj.content !== undefined) {
-      return countTokenLikeEntries(obj.content);
-    }
-    if (typeof obj.text === 'string') {
-      return obj.text.trim() ? 1 : 0;
-    }
-    return 0;
-  }
+   if (typeof value === 'object') {
+     const obj = value as Record<string, unknown>;
+     if (obj.tokens !== undefined) {
+       return countTokensInContent(obj.tokens, encoding);
+     }
+     if (obj.content !== undefined) {
+       return countTokensInContent(obj.content, encoding);
+     }
+     if (typeof obj.text === 'string') {
+       if (!obj.text.trim()) {
+         return 0;
+       }
+       return encoding.encode(obj.text).length;
+     }
+     return 0;
+   }
 
-  return 0;
+   return 0;
 }
 
 /**
