@@ -18,6 +18,7 @@ interface Config {
   model: string;
   prompt: string;
   json: boolean;
+  stream: boolean;
   effort: 'minimal' | 'low' | 'medium' | 'high' | undefined;
 }
 
@@ -213,6 +214,12 @@ async function getConfig(): Promise<Config> {
       description: 'Output the results in JSON format.',
       default: false,
     })
+    .option('stream', {
+      alias: 's',
+      type: 'boolean',
+      description: 'Use streaming mode for the API request.',
+      default: true,
+    })
     .option('effort', {
       alias: 'e',
       type: 'string',
@@ -236,6 +243,7 @@ async function getConfig(): Promise<Config> {
     model: argv.model as string,
     prompt: argv.prompt as string,
     json: argv.json ?? false,
+    stream: argv.stream ?? true,
     effort: argv.effort,
   };
   return config;
@@ -246,7 +254,7 @@ async function getConfig(): Promise<Config> {
  * @param config - The configuration object.
  */
 async function runBenchmark(config: Config): Promise<void> {
-   const { apiBaseUrl, apiKey, model, prompt, json, effort } = config;
+   const { apiBaseUrl, apiKey, model, prompt, json, stream, effort } = config;
    const progress = new ProgressIndicator(json);
 
    progress.start('Connecting...');
@@ -289,7 +297,7 @@ async function runBenchmark(config: Config): Promise<void> {
     } = {
       model,
       messages: [{ role: 'user', content: prompt }],
-      stream: true,
+      stream,
     };
 
     if (effort) {
@@ -306,101 +314,134 @@ async function runBenchmark(config: Config): Promise<void> {
       body: JSON.stringify(body),
     });
 
-    if (!response.ok || !response.body) {
+    if (!response.ok) {
       const errorBody = await response.text();
       throw new Error(`API Error: ${response.status} ${response.statusText} - ${errorBody}`);
     }
 
-    progress.update('Waiting for First Token...');
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
+    let T_end: number;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
+    if (stream) {
+      // Streaming mode
+      if (!response.body) {
+        throw new Error('Response body is null for streaming request');
       }
 
-      const chunk = decoder.decode(value, { stream: true });
-      const lines = chunk.split('\n').filter((line) => line.trim().startsWith('data:'));
+      progress.update('Waiting for First Token...');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
 
-      let chunkProducedTokens = false;
-      let chunkProducedCompletionTokens = 0;
-      let chunkProducedReasoningTokens = 0;
-      for (const line of lines) {
-        const data = line.substring(5).trim();
-        if (data === '[DONE]') {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
           break;
         }
-        try {
-          const parsed = JSON.parse(data);
-          const delta = parsed.choices?.[0]?.delta;
-          if (!delta) {
-            continue;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split('\n').filter((line) => line.trim().startsWith('data:'));
+
+        let chunkProducedTokens = false;
+        let chunkProducedCompletionTokens = 0;
+        let chunkProducedReasoningTokens = 0;
+        for (const line of lines) {
+          const data = line.substring(5).trim();
+          if (data === '[DONE]') {
+            break;
           }
-          const completionCount = countTokensInContent(delta.content, encoding);
-          const reasoningCount = countTokensInContent(delta.reasoning, encoding);
-          const reasoningContentCount = countTokensInContent((delta as Record<string, unknown>).reasoning_content, encoding);
-          const totalReasoning = reasoningCount + reasoningContentCount;
-          if (completionCount > 0 || totalReasoning > 0) {
-            chunkProducedTokens = true;
-            chunkProducedCompletionTokens += completionCount;
-            chunkProducedReasoningTokens += totalReasoning;
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed.choices?.[0]?.delta;
+            if (!delta) {
+              continue;
+            }
+            const completionCount = countTokensInContent(delta.content, encoding);
+            const reasoningCount = countTokensInContent(delta.reasoning, encoding);
+            const reasoningContentCount = countTokensInContent((delta as Record<string, unknown>).reasoning_content, encoding);
+            const totalReasoning = reasoningCount + reasoningContentCount;
+            if (completionCount > 0 || totalReasoning > 0) {
+              chunkProducedTokens = true;
+              chunkProducedCompletionTokens += completionCount;
+              chunkProducedReasoningTokens += totalReasoning;
+            }
+          } catch (e) {
+            // Ignore parsing errors for non-JSON lines
           }
-        } catch (e) {
-          // Ignore parsing errors for non-JSON lines
+        }
+
+        if (chunkProducedTokens) {
+          const chunkTime = performance.now();
+
+          const producedTokens = chunkProducedCompletionTokens + chunkProducedReasoningTokens;
+          totalOutputTokens += producedTokens;
+          completionTokens += chunkProducedCompletionTokens;
+          reasoningTokens += chunkProducedReasoningTokens;
+
+          const registerTimestamp = (container: number[], count: number) => {
+            for (let i = 0; i < count; i++) {
+              container.push(chunkTime);
+            }
+          };
+
+          if (chunkProducedCompletionTokens > 0) {
+            registerTimestamp(tokenTimestamps.completion, chunkProducedCompletionTokens);
+            registerTimestamp(tokenTimestamps.all, chunkProducedCompletionTokens);
+          }
+
+          if (chunkProducedReasoningTokens > 0) {
+            registerTimestamp(tokenTimestamps.reasoning, chunkProducedReasoningTokens);
+            registerTimestamp(tokenTimestamps.all, chunkProducedReasoningTokens);
+          }
+
+          if (tokenTimestamps.all.length >= 2 && T_second_token === null) {
+            T_second_token = tokenTimestamps.all[1]!;
+          }
+
+          const totalTokensLabel = totalOutputTokens === 1 ? 'token' : 'tokens';
+          const completionLabel = completionTokens === 1 ? 'token' : 'tokens';
+          const reasoningLabel = reasoningTokens === 1 ? 'token' : 'tokens';
+
+          let message = `Receiving Tokens... (total: ${totalOutputTokens} ${totalTokensLabel}`;
+          message += ` | completion: ${completionTokens} ${completionLabel}`;
+          message += ` | reasoning: ${reasoningTokens} ${reasoningLabel}`;
+
+          if (T_second_token && totalOutputTokens > 1) {
+            const elapsedS = (chunkTime - T_second_token) / 1000;
+            const tokensSinceSecond = totalOutputTokens - 1;
+            const tokensPerSecond = elapsedS > 0 ? tokensSinceSecond / elapsedS : 0;
+            message += ` @ ${tokensPerSecond.toFixed(2)} tokens/s`;
+          }
+          message += ')';
+          progress.update(message);
         }
       }
 
-      if (chunkProducedTokens) {
-        const chunkTime = performance.now();
+      T_end = performance.now();
+      progress.stop('Finished receiving tokens.');
+    } else {
+      // Non-streaming mode
+      progress.update('Waiting for response...');
+      const responseData = await response.json();
+      T_end = performance.now();
+      progress.stop('Finished receiving response.');
 
-        const producedTokens = chunkProducedCompletionTokens + chunkProducedReasoningTokens;
-        totalOutputTokens += producedTokens;
-        completionTokens += chunkProducedCompletionTokens;
-        reasoningTokens += chunkProducedReasoningTokens;
-
-        const registerTimestamp = (container: number[], count: number) => {
-          for (let i = 0; i < count; i++) {
-            container.push(chunkTime);
-          }
-        };
-
-        if (chunkProducedCompletionTokens > 0) {
-          registerTimestamp(tokenTimestamps.completion, chunkProducedCompletionTokens);
-          registerTimestamp(tokenTimestamps.all, chunkProducedCompletionTokens);
+      // Extract token counts from usage field
+      const usage = responseData.usage;
+      if (usage) {
+        completionTokens = usage.completion_tokens || 0;
+        reasoningTokens = usage.reasoning_tokens || 0;
+        totalOutputTokens = completionTokens + reasoningTokens;
+      } else {
+        // Fallback: count tokens from the response content
+        const message = responseData.choices?.[0]?.message;
+        if (message) {
+          completionTokens = countTokensInContent(message.content, encoding);
+          reasoningTokens = countTokensInContent(message.reasoning, encoding) +
+                           countTokensInContent((message as Record<string, unknown>).reasoning_content, encoding);
+          totalOutputTokens = completionTokens + reasoningTokens;
         }
-
-        if (chunkProducedReasoningTokens > 0) {
-          registerTimestamp(tokenTimestamps.reasoning, chunkProducedReasoningTokens);
-          registerTimestamp(tokenTimestamps.all, chunkProducedReasoningTokens);
-        }
-
-        if (tokenTimestamps.all.length >= 2 && T_second_token === null) {
-          T_second_token = tokenTimestamps.all[1]!;
-        }
-
-        const totalTokensLabel = totalOutputTokens === 1 ? 'token' : 'tokens';
-        const completionLabel = completionTokens === 1 ? 'token' : 'tokens';
-        const reasoningLabel = reasoningTokens === 1 ? 'token' : 'tokens';
-
-        let message = `Receiving Tokens... (total: ${totalOutputTokens} ${totalTokensLabel}`;
-        message += ` | completion: ${completionTokens} ${completionLabel}`;
-        message += ` | reasoning: ${reasoningTokens} ${reasoningLabel}`;
-
-        if (T_second_token && totalOutputTokens > 1) {
-          const elapsedS = (chunkTime - T_second_token) / 1000;
-          const tokensSinceSecond = totalOutputTokens - 1;
-          const tokensPerSecond = elapsedS > 0 ? tokensSinceSecond / elapsedS : 0;
-          message += ` @ ${tokensPerSecond.toFixed(2)} tokens/s`;
-        }
-        message += ')';
-        progress.update(message);
       }
     }
 
-    const T_end = performance.now();
-    progress.stop('Finished receiving tokens.');
     const totalWallClockTimeMs = T_end - T_start;
 
     // Estimate prompt tokens using tiktoken
@@ -453,7 +494,7 @@ async function runBenchmark(config: Config): Promise<void> {
       },
     };
 
-    printResults(results, config.json);
+    printResults(results, config.json, config.stream);
 
   } catch (error) {
     console.error('An error occurred during the benchmark:', error);
@@ -467,7 +508,7 @@ async function runBenchmark(config: Config): Promise<void> {
  * @param results - The benchmark results object.
  * @param asJson - Whether to print in JSON format.
  */
-function printResults(results: BenchmarkResults, asJson: boolean): void {
+function printResults(results: BenchmarkResults, asJson: boolean, isStreaming: boolean): void {
   if (asJson) {
     // Create a new object for JSON output that doesn't include the full latencies array
     const jsonOutput = {
@@ -517,7 +558,9 @@ function printResults(results: BenchmarkResults, asJson: boolean): void {
   console.log('Metrics');
   console.log('-----------------------');
   console.log(`Total Wall Clock Time: ${results.metrics.totalWallClockTimeMs} ms (${ms(results.metrics.totalWallClockTimeMs)})`);
-  console.log(`Time to Second Token (all tokens): ${results.metrics.timeToSecondTokenMs} ms (${ms(results.metrics.timeToSecondTokenMs)})`);
+  if (isStreaming) {
+    console.log(`Time to Second Token (all tokens): ${results.metrics.timeToSecondTokenMs} ms (${ms(results.metrics.timeToSecondTokenMs)})`);
+  }
   console.log();
 
   console.log('Token Counts');
@@ -530,25 +573,31 @@ function printResults(results: BenchmarkResults, asJson: boolean): void {
 
   const { reasoningInclusive, reasoningOnly, completionOnly } = results.metrics.views;
 
-  console.log('Reasoning + Completion View');
-  console.log('-----------------------');
-  console.log(`Time to Second Token:             ${reasoningInclusive.timeToSecondTokenMs} ms (${ms(reasoningInclusive.timeToSecondTokenMs)})`);
-  console.log(`Time to Second Reasoning Token:   ${reasoningOnly.timeToSecondTokenMs} ms (${ms(reasoningOnly.timeToSecondTokenMs)})`);
-  console.log(`Time to Second Completion Token:  ${completionOnly.timeToSecondTokenMs} ms (${ms(completionOnly.timeToSecondTokenMs)})`);
-  console.log(`Output Rate (since 2nd reasoning token): ${reasoningOnly.outputRateTpsFromSecondToken} tokens/sec`);
-  console.log(`Output Rate (since 2nd completion token): ${completionOnly.outputRateTpsFromSecondToken} tokens/sec`);
-  console.log(`Output Rate (wall clock):              ${reasoningInclusive.outputRateTpsFromRequestStart} tokens/sec`);
-  console.log();
+  if (isStreaming) {
+    console.log('Reasoning + Completion View');
+    console.log('-----------------------');
+    console.log(`Time to Second Token:             ${reasoningInclusive.timeToSecondTokenMs} ms (${ms(reasoningInclusive.timeToSecondTokenMs)})`);
+    console.log(`Time to Second Reasoning Token:   ${reasoningOnly.timeToSecondTokenMs} ms (${ms(reasoningOnly.timeToSecondTokenMs)})`);
+    console.log(`Time to Second Completion Token:  ${completionOnly.timeToSecondTokenMs} ms (${ms(completionOnly.timeToSecondTokenMs)})`);
+    console.log(`Output Rate (since 2nd reasoning token): ${reasoningOnly.outputRateTpsFromSecondToken} tokens/sec`);
+    console.log(`Output Rate (since 2nd completion token): ${completionOnly.outputRateTpsFromSecondToken} tokens/sec`);
+    console.log(`Output Rate (wall clock):              ${reasoningInclusive.outputRateTpsFromRequestStart} tokens/sec`);
+    console.log();
 
-  console.log('Inter-Token Latency (ms)');
-  console.log('-----------------------');
-  console.log(`Min:                 ${reasoningInclusive.interTokenLatencyMs.min} ms`);
-  console.log(`Mean:                ${reasoningInclusive.interTokenLatencyMs.mean} ms`);
-  console.log(`Median:              ${reasoningInclusive.interTokenLatencyMs.median} ms`);
-  console.log(`Max:                 ${reasoningInclusive.interTokenLatencyMs.max} ms`);
-  console.log(`p90:                 ${reasoningInclusive.interTokenLatencyMs.p90} ms`);
-  console.log(`p95:                 ${reasoningInclusive.interTokenLatencyMs.p95} ms`);
-  console.log(`p99:                 ${reasoningInclusive.interTokenLatencyMs.p99} ms`);
+    console.log('Inter-Token Latency (ms)');
+    console.log('-----------------------');
+    console.log(`Min:                 ${reasoningInclusive.interTokenLatencyMs.min} ms`);
+    console.log(`Mean:                ${reasoningInclusive.interTokenLatencyMs.mean} ms`);
+    console.log(`Median:              ${reasoningInclusive.interTokenLatencyMs.median} ms`);
+    console.log(`Max:                 ${reasoningInclusive.interTokenLatencyMs.max} ms`);
+    console.log(`p90:                 ${reasoningInclusive.interTokenLatencyMs.p90} ms`);
+    console.log(`p95:                 ${reasoningInclusive.interTokenLatencyMs.p95} ms`);
+    console.log(`p99:                 ${reasoningInclusive.interTokenLatencyMs.p99} ms`);
+  } else {
+    console.log('Reasoning + Completion View');
+    console.log('-----------------------');
+    console.log(`Output Rate (wall clock):              ${reasoningInclusive.outputRateTpsFromRequestStart.toFixed(2)} tokens/sec`);
+  }
 }
 
 // --- Entry Point ---
