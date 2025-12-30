@@ -34,6 +34,9 @@ interface TokenCounts {
   completionTokens: number;
   reasoningTokens: number;
   totalOutputTokens: number;
+  isPromptEstimated: boolean;
+  isCompletionEstimated: boolean;
+  isReasoningEstimated: boolean;
 }
 
 interface LatencyStats {
@@ -299,6 +302,7 @@ async function runBenchmark(config: Config): Promise<void> {
       model: string;
       messages: { role: string; content: string }[];
       stream: boolean;
+      stream_options?: { include_usage: boolean };
       reasoning?: {
         effort: 'minimal' | 'low' | 'medium' | 'high';
       };
@@ -306,6 +310,7 @@ async function runBenchmark(config: Config): Promise<void> {
       model,
       messages: [{ role: 'user', content: prompt }],
       stream,
+      stream_options: { include_usage: true }
     };
 
     if (effort) {
@@ -458,17 +463,23 @@ async function runBenchmark(config: Config): Promise<void> {
 
     // Use actual usage data if available, otherwise fall back to estimates
     let promptTokens: number;
+    let isPromptEstimated = true;
+    let isCompletionEstimated = true;
+    let isReasoningEstimated = true;
     
     if (usageData && usageData.prompt_tokens !== undefined && usageData.prompt_tokens !== null) {
       // Override with actual usage data
       promptTokens = usageData.prompt_tokens;
+      isPromptEstimated = false;
       
       if (usageData.completion_tokens !== undefined && usageData.completion_tokens !== null) {
         completionTokens = usageData.completion_tokens;
+        isCompletionEstimated = false;
       }
       
       if (usageData.reasoning_tokens !== undefined && usageData.reasoning_tokens !== null) {
         reasoningTokens = usageData.reasoning_tokens;
+        isReasoningEstimated = false;
       }
       
       // Recalculate total output tokens from actual usage data
@@ -524,6 +535,9 @@ async function runBenchmark(config: Config): Promise<void> {
         completionTokens,
         reasoningTokens,
         totalOutputTokens,
+        isPromptEstimated,
+        isCompletionEstimated,
+        isReasoningEstimated,
       },
     };
 
@@ -598,10 +612,15 @@ function printResults(results: BenchmarkResults, asJson: boolean, isStreaming: b
 
   console.log('Token Counts');
   console.log('-----------------------');
-  console.log(`Prompt Tokens:         ${results.tokenCounts.promptTokens}`);
-  console.log(`Reasoning Tokens:      ${results.tokenCounts.reasoningTokens}`);
-  console.log(`Completion Tokens:     ${results.tokenCounts.completionTokens}`);
-  console.log(`Total Output Tokens:   ${results.tokenCounts.totalOutputTokens}`);
+  const promptLabel = results.tokenCounts.isPromptEstimated ? ' (est.)' : '';
+  const reasoningLabel = results.tokenCounts.isReasoningEstimated ? ' (est.)' : '';
+  const completionLabel = results.tokenCounts.isCompletionEstimated ? ' (est.)' : '';
+  const totalLabel = (results.tokenCounts.isCompletionEstimated || results.tokenCounts.isReasoningEstimated) ? ' (est.)' : '';
+  
+  console.log(`Prompt Tokens:         ${results.tokenCounts.promptTokens}${promptLabel}`);
+  console.log(`Reasoning Tokens:      ${results.tokenCounts.reasoningTokens}${reasoningLabel}`);
+  console.log(`Completion Tokens:     ${results.tokenCounts.completionTokens}${completionLabel}`);
+  console.log(`Total Output Tokens:   ${results.tokenCounts.totalOutputTokens}${totalLabel}`);
   console.log();
 
   const { reasoningInclusive, reasoningOnly, completionOnly } = results.metrics.views;
