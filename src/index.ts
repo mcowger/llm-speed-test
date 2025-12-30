@@ -12,6 +12,13 @@ dotenv.config({ quiet: true });
 
 // --- Type Definitions ---
 
+interface UsageData {
+  prompt_tokens?: number;
+  reasoning_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+}
+
 interface Config {
   apiBaseUrl: string;
   apiKey: string;
@@ -270,6 +277,7 @@ async function runBenchmark(config: Config): Promise<void> {
    let totalOutputTokens = 0;
    let completionTokens = 0;
    let reasoningTokens = 0;
+   let usageData: UsageData | null = null;
 
    // Initialize encoding for token counting
    const encoding = get_encoding('cl100k_base');
@@ -350,6 +358,12 @@ async function runBenchmark(config: Config): Promise<void> {
           }
           try {
             const parsed = JSON.parse(data);
+            
+            // Capture usage data if present
+            if (parsed.usage && parsed.usage !== null) {
+              usageData = parsed.usage;
+            }
+            
             const delta = parsed.choices?.[0]?.delta;
             if (!delta) {
               continue;
@@ -442,10 +456,28 @@ async function runBenchmark(config: Config): Promise<void> {
       }
     }
 
-
-
-    // Estimate prompt tokens using tiktoken
-    const promptTokens = encoding.encode(prompt).length;
+    // Use actual usage data if available, otherwise fall back to estimates
+    let promptTokens: number;
+    
+    if (usageData && usageData.prompt_tokens !== undefined && usageData.prompt_tokens !== null) {
+      // Override with actual usage data
+      promptTokens = usageData.prompt_tokens;
+      
+      if (usageData.completion_tokens !== undefined && usageData.completion_tokens !== null) {
+        completionTokens = usageData.completion_tokens;
+      }
+      
+      if (usageData.reasoning_tokens !== undefined && usageData.reasoning_tokens !== null) {
+        reasoningTokens = usageData.reasoning_tokens;
+      }
+      
+      // Recalculate total output tokens from actual usage data
+      totalOutputTokens = completionTokens + reasoningTokens;
+    } else {
+      // Estimate prompt tokens using tiktoken
+      promptTokens = encoding.encode(prompt).length;
+    }
+    
     encoding.free();
     const totalWallClockTimeMs = T_end - T_start;
 
@@ -566,7 +598,7 @@ function printResults(results: BenchmarkResults, asJson: boolean, isStreaming: b
 
   console.log('Token Counts');
   console.log('-----------------------');
-  console.log(`Prompt Tokens:         ${results.tokenCounts.promptTokens} (estimated)`);
+  console.log(`Prompt Tokens:         ${results.tokenCounts.promptTokens}`);
   console.log(`Reasoning Tokens:      ${results.tokenCounts.reasoningTokens}`);
   console.log(`Completion Tokens:     ${results.tokenCounts.completionTokens}`);
   console.log(`Total Output Tokens:   ${results.tokenCounts.totalOutputTokens}`);
