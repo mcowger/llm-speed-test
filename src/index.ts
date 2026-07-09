@@ -27,6 +27,7 @@ interface Config {
   json: boolean;
   stream: boolean;
   effort: 'minimal' | 'low' | 'medium' | 'high' | undefined;
+  extraBody: Record<string, unknown>;
 }
 
 interface TokenCounts {
@@ -140,6 +141,46 @@ const calculateLatencyStats = (latencies: number[]): LatencyStats => {
   };
 };
 
+function parseExtraBodyValue(value: string): unknown {
+  const trimmedValue = value.trim();
+
+  if (trimmedValue === '') {
+    return '';
+  }
+
+  try {
+    return JSON.parse(trimmedValue);
+  } catch {
+    if (
+      (trimmedValue.startsWith('"') && trimmedValue.endsWith('"')) ||
+      (trimmedValue.startsWith("'") && trimmedValue.endsWith("'"))
+    ) {
+      return trimmedValue.slice(1, -1);
+    }
+    return trimmedValue;
+  }
+}
+
+function parseExtraBodyParams(extraBodyParams: string[] | undefined): Record<string, unknown> {
+  const extraBody: Record<string, unknown> = {};
+
+  for (const param of extraBodyParams ?? []) {
+    const separatorIndex = param.indexOf(':');
+    if (separatorIndex === -1) {
+      throw new Error(`Invalid --extra-body value "${param}". Expected "key: value".`);
+    }
+
+    const key = param.slice(0, separatorIndex).trim();
+    if (!key) {
+      throw new Error(`Invalid --extra-body value "${param}". Key cannot be empty.`);
+    }
+
+    extraBody[key] = parseExtraBodyValue(param.slice(separatorIndex + 1));
+  }
+
+  return extraBody;
+}
+
 // --- Main Application Logic ---
 
 class ProgressIndicator {
@@ -236,6 +277,11 @@ async function getConfig(): Promise<Config> {
       description: 'Reasoning effort level.',
       choices: ['minimal', 'low', 'medium', 'high'] as const,
     })
+    .option('extra-body', {
+      type: 'string',
+      array: true,
+      description: 'Add a top-level request body parameter as "key: value". May be repeated.',
+    })
     .help()
     .alias('help', 'h')
     .parse();
@@ -247,6 +293,14 @@ async function getConfig(): Promise<Config> {
     throw new Error('Missing required arguments.');
   }
 
+  let extraBody: Record<string, unknown>;
+  try {
+    extraBody = parseExtraBodyParams(argv.extraBody as string[] | undefined);
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    throw error;
+  }
+
   const config: Config = {
     apiBaseUrl: argv.apiBaseUrl as string,
     apiKey: argv.apiKey as string,
@@ -255,6 +309,7 @@ async function getConfig(): Promise<Config> {
     json: argv.json ?? false,
     stream: argv.stream ?? true,
     effort: argv.effort,
+    extraBody,
   };
   return config;
 }
@@ -264,7 +319,7 @@ async function getConfig(): Promise<Config> {
  * @param config - The configuration object.
  */
 async function runBenchmark(config: Config): Promise<void> {
-   const { apiBaseUrl, apiKey, model, prompt, json, stream, effort } = config;
+   const { apiBaseUrl, apiKey, model, prompt, json, stream, effort, extraBody } = config;
    const progress = new ProgressIndicator(json);
 
    progress.start('Connecting...');
@@ -306,6 +361,7 @@ async function runBenchmark(config: Config): Promise<void> {
       reasoning?: {
         effort: 'minimal' | 'low' | 'medium' | 'high';
       };
+      [key: string]: unknown;
     } = {
       model,
       messages: [{ role: 'user', content: prompt }],
@@ -316,6 +372,8 @@ async function runBenchmark(config: Config): Promise<void> {
     if (effort) {
       body.reasoning = { effort };
     }
+
+    Object.assign(body, extraBody);
 
     progress.update('Sending Request...');
     const response = await fetch(finalUrl, {

@@ -73,6 +73,7 @@ The tool requires four pieces of information to run:
 | API Key | `--api-key <key>` | `LLM_API_KEY` | Yes | The authentication key for the API. |
 | Model Name | `--model <name>` | `LLM_MODEL_NAME` | Yes | The specific model to be benchmarked (e.g., `gpt-4o`). |
 | Prompt | `--prompt <text>` | `LLM_PROMPT` | Yes | The input text to send to the model. |
+| Extra Body Parameter | `--extra-body "key: value"` | N/A | No | Adds a top-level JSON request body parameter. May be repeated. |
 
 ### Examples
 
@@ -84,6 +85,28 @@ The tool requires four pieces of information to run:
   --api-key "sk-..." \
   --model "gpt-4o" \
   --prompt "Tell me a short story about a robot who discovers music."
+```
+
+#### Injecting Extra Request Body Parameters
+
+Use `--extra-body` to add provider-specific top-level body parameters to the API request. The flag may be repeated:
+
+```bash
+./dist/index.js \
+  --api-base-url "https://api.openai.com/v1" \
+  --api-key "sk-..." \
+  --model "gpt-4o" \
+  --prompt "Tell me a short story about a robot who discovers music." \
+  --extra-body "service_tier: priority" \
+  --extra-body "temperature: 0.2"
+```
+
+Values are parsed as JSON when possible, so numbers, booleans, arrays, and objects can be passed directly:
+
+```bash
+./dist/index.js \
+  --extra-body "temperature: 0.2" \
+  --extra-body "metadata: {\"benchmark\":\"latency\"}"
 ```
 
 #### Using Environment Variables
